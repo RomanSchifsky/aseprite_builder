@@ -54,7 +54,7 @@ jobs:
 
     steps:
       - name: Install Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v1
+        run: choco install ninja
 
       - name: Get Skia from cache
         id: skia-cache
