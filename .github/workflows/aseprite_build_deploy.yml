@@ -22,122 +22,194 @@ jobs:
           - os: windows
             runner: windows-latest
             artifact: aseprite-windows
+            skia_asset_pattern: 'Windows-Release-x64.zip'
           - os: linux
             runner: ubuntu-22.04
             artifact: aseprite-linux
+            skia_asset_pattern: 'Linux-Release-x64.zip'
           - os: macos
             runner: macos-14
             artifact: aseprite-macos
+            skia_asset_pattern: 'macOS-Release-arm64.zip'
 
     steps:
-      # ── Resolve the target Aseprite version ──────────────────────────────────
+      # ── Resolve Aseprite version ──────────────────────────────────────────────
       - name: Resolve Aseprite version
-        id: aseprite_version
+        id: aseprite_ver
         shell: bash
         run: |
           VERSION="${{ github.event.inputs.aseprite_version }}"
           if [ -z "$VERSION" ]; then
-            VERSION=$(curl -fsSL "https://api.github.com/repos/aseprite/aseprite/releases/latest" \
+            VERSION=$(curl -fsSL \
               -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/aseprite/aseprite/releases/latest" \
               | jq -r '.tag_name')
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Resolved version: $VERSION"
+          echo "Resolved Aseprite version: $VERSION"
 
-      # ── Check cache to skip redundant builds ─────────────────────────────────
+      # ── Check cache ───────────────────────────────────────────────────────────
       - name: Restore build cache
         id: cache
         uses: actions/cache@v4
         with:
           path: aseprite-build
-          key: aseprite-${{ matrix.os }}-${{ steps.aseprite_version.outputs.version }}
+          key: aseprite-${{ matrix.os }}-${{ steps.aseprite_ver.outputs.version }}
 
-      # ── Checkout Aseprite source ──────────────────────────────────────────────
-      - name: Checkout Aseprite
+      # ── Checkout Aseprite ─────────────────────────────────────────────────────
+      - name: Checkout Aseprite source
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
         with:
           repository: aseprite/aseprite
-          ref: ${{ steps.aseprite_version.outputs.version }}
+          ref: ${{ steps.aseprite_ver.outputs.version }}
           submodules: recursive
 
-      # ── Fetch Skia pre-built library ──────────────────────────────────────────
-      - name: Resolve Skia version
+      # ── Resolve Skia release asset URL via GitHub API ─────────────────────────
+      #
+      #   Skia release tags look like: m124-08a5439a6b
+      #   Asset names look like:       Skia-m124-08a5439a6b-Windows-Release-x64.zip
+      #
+      #   We read the Skia branch from Aseprite's DEPS file (most reliable),
+      #   derive the milestone, then query the API to find the matching release
+      #   and pick the right platform asset — no URL guessing needed.
+      - name: Resolve Skia download URL
         if: steps.cache.outputs.cache-hit != 'true'
-        id: skia_version
+        id: skia
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASSET_PATTERN: ${{ matrix.skia_asset_pattern }}
+        run: |
+          # 1. Read the Skia branch from Aseprite's DEPS file
+          SKIA_BRANCH=$(grep -oP "(?<='aseprite-m)\d+" DEPS 2>/dev/null | head -1)
+          if [ -n "$SKIA_BRANCH" ]; then
+            MILESTONE="m${SKIA_BRANCH}"
+          else
+            # Fallback: read from INSTALL.md
+            MILESTONE=$(grep -oP 'aseprite-m\d+' INSTALL.md | head -1 | grep -oP 'm\d+')
+          fi
+          MILESTONE="${MILESTONE:-m124}"
+          echo "Skia milestone: $MILESTONE"
+
+          # 2. List Skia releases and find the most recent one for this milestone
+          RELEASES=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/aseprite/skia/releases?per_page=50")
+
+          RELEASE=$(echo "$RELEASES" | jq -r \
+            --arg ms "${MILESTONE}-" \
+            '[.[] | select(.tag_name | startswith($ms))] | first')
+
+          if [ -z "$RELEASE" ] || [ "$RELEASE" = "null" ]; then
+            echo "ERROR: No Skia release found for milestone $MILESTONE"
+            echo "Available tags:"
+            echo "$RELEASES" | jq -r '.[].tag_name'
+            exit 1
+          fi
+
+          TAG=$(echo "$RELEASE" | jq -r '.tag_name')
+          echo "Skia release tag: $TAG"
+
+          # 3. Find the asset whose name contains our platform pattern
+          ASSET_URL=$(echo "$RELEASE" | jq -r \
+            --arg pat "$ASSET_PATTERN" \
+            '.assets[] | select(.name | contains($pat)) | .browser_download_url' \
+            | head -1)
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "ERROR: No asset matching '$ASSET_PATTERN' found in release $TAG"
+            echo "Available assets:"
+            echo "$RELEASE" | jq -r '.assets[].name'
+            exit 1
+          fi
+
+          echo "Skia asset URL: $ASSET_URL"
+          echo "url=$ASSET_URL" >> "$GITHUB_OUTPUT"
+
+      # ── Download and extract Skia ─────────────────────────────────────────────
+      - name: Download and extract Skia
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          SKIA_VER=$(curl -fsSL "https://raw.githubusercontent.com/aseprite/aseprite/${{ steps.aseprite_version.outputs.version }}/INSTALL.md" \
-            | grep -oP 'Skia-[A-Za-z0-9\-]+' | head -1 || echo "Skia-m102")
-          echo "version=$SKIA_VER" >> "$GITHUB_OUTPUT"
+          curl -fsSL -L -o skia.zip "${{ steps.skia.outputs.url }}"
+          mkdir skia
+          if command -v 7z &>/dev/null; then
+            7z x skia.zip -oskia -y
+          else
+            unzip -q skia.zip -d skia
+          fi
+          echo "Skia top-level contents:"
+          ls skia/
 
-      - name: Download Skia (Windows)
-        if: steps.cache.outputs.cache-hit != 'true' && matrix.os == 'windows'
-        shell: bash
-        run: |
-          curl -fsSL -o skia.zip \
-            "https://github.com/aseprite/skia/releases/download/${{ steps.skia_version.outputs.version }}/${{ steps.skia_version.outputs.version }}-Windows-Release-x64.zip"
-          7z x skia.zip -oskia -y
-
-      - name: Download Skia (Linux)
-        if: steps.cache.outputs.cache-hit != 'true' && matrix.os == 'linux'
-        run: |
-          curl -fsSL -o skia.zip \
-            "https://github.com/aseprite/skia/releases/download/${{ steps.skia_version.outputs.version }}/${{ steps.skia_version.outputs.version }}-Linux-Release-x64.zip"
-          unzip -q skia.zip -d skia
-
-      - name: Download Skia (macOS)
-        if: steps.cache.outputs.cache-hit != 'true' && matrix.os == 'macos'
-        run: |
-          curl -fsSL -o skia.zip \
-            "https://github.com/aseprite/skia/releases/download/${{ steps.skia_version.outputs.version }}/${{ steps.skia_version.outputs.version }}-macOS-Release-arm64.zip"
-          unzip -q skia.zip -d skia
-
-      # ── Install dependencies ──────────────────────────────────────────────────
+      # ── Install Linux dependencies ────────────────────────────────────────────
       - name: Install Linux dependencies
         if: steps.cache.outputs.cache-hit != 'true' && matrix.os == 'linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build clang libx11-dev libxcursor-dev libxi-dev \
+            cmake ninja-build clang \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
             libgl1-mesa-dev libfontconfig1-dev
 
+      # ── Install Windows dependencies ──────────────────────────────────────────
       - name: Install Windows dependencies
         if: steps.cache.outputs.cache-hit != 'true' && matrix.os == 'windows'
         run: choco install ninja --no-progress -y
 
-      - name: Set up MSVC (Windows)
+      - name: Set up MSVC environment (Windows)
         if: steps.cache.outputs.cache-hit != 'true' && matrix.os == 'windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # ── Configure & build ─────────────────────────────────────────────────────
-      - name: Configure (Windows)
+      # ── CMake configure: Windows ──────────────────────────────────────────────
+      - name: Configure CMake (Windows)
         if: steps.cache.outputs.cache-hit != 'true' && matrix.os == 'windows'
         shell: cmd
         run: |
-          mkdir build && cd build
+          mkdir build
+          cd build
           cmake .. ^
             -G Ninja ^
-            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo ^
             -DLAF_BACKEND=skia ^
-            -DSKIA_DIR=%CD%\..\skia ^
-            -DSKIA_LIBRARY_DIR=%CD%\..\skia\out\Release-x64 ^
-            -DSKIA_LIBRARY=%CD%\..\skia\out\Release-x64\skia.lib
+            -DSKIA_DIR="%GITHUB_WORKSPACE%\skia" ^
+            -DSKIA_LIBRARY_DIR="%GITHUB_WORKSPACE%\skia\out\Release-x64" ^
+            -DSKIA_LIBRARY="%GITHUB_WORKSPACE%\skia\out\Release-x64\skia.lib"
 
-      - name: Configure (Linux/macOS)
-        if: steps.cache.outputs.cache-hit != 'true' && matrix.os != 'windows'
+      # ── CMake configure: Linux ────────────────────────────────────────────────
+      #   INSTALL.md requires -stdlib=libstdc++ when using pre-built Skia.
+      - name: Configure CMake (Linux)
+        if: steps.cache.outputs.cache-hit != 'true' && matrix.os == 'linux'
+        run: |
+          export CC=clang
+          export CXX=clang++
+          mkdir build && cd build
+          cmake .. \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-stdlib=libstdc++" \
+            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libstdc++" \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR="$GITHUB_WORKSPACE/skia" \
+            -DSKIA_LIBRARY_DIR="$GITHUB_WORKSPACE/skia/out/Release-x64" \
+            -DSKIA_LIBRARY="$GITHUB_WORKSPACE/skia/out/Release-x64/libskia.a"
+
+      # ── CMake configure: macOS ────────────────────────────────────────────────
+      - name: Configure CMake (macOS)
+        if: steps.cache.outputs.cache-hit != 'true' && matrix.os == 'macos'
         run: |
           mkdir build && cd build
           cmake .. \
             -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLAF_BACKEND=skia \
             -DSKIA_DIR="$GITHUB_WORKSPACE/skia" \
-            -DSKIA_LIBRARY_DIR="$GITHUB_WORKSPACE/skia/out/Release-$(uname -m)" \
-            -DSKIA_LIBRARY="$GITHUB_WORKSPACE/skia/out/Release-$(uname -m)/libskia.a"
+            -DSKIA_LIBRARY_DIR="$GITHUB_WORKSPACE/skia/out/Release-arm64" \
+            -DSKIA_LIBRARY="$GITHUB_WORKSPACE/skia/out/Release-arm64/libskia.a"
 
+      # ── Build ─────────────────────────────────────────────────────────────────
       - name: Build
         if: steps.cache.outputs.cache-hit != 'true'
         working-directory: build
@@ -154,11 +226,11 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}-${{ steps.aseprite_version.outputs.version }}
+          name: ${{ matrix.artifact }}-${{ steps.aseprite_ver.outputs.version }}
           path: aseprite-build/
           retention-days: 30
 
-  # ── Optional: create a GitHub Release with all binaries ──────────────────────
+  # ── Create a GitHub Release (manual trigger only) ─────────────────────────────
   release:
     name: Create Release
     needs: build
@@ -167,14 +239,15 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Resolve version (again)
+      - name: Resolve Aseprite version
         id: ver
         shell: bash
         run: |
           VERSION="${{ github.event.inputs.aseprite_version }}"
           if [ -z "$VERSION" ]; then
-            VERSION=$(curl -fsSL "https://api.github.com/repos/aseprite/aseprite/releases/latest" \
+            VERSION=$(curl -fsSL \
               -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/aseprite/aseprite/releases/latest" \
               | jq -r '.tag_name')
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -199,8 +272,8 @@ jobs:
           body: |
             Automated build of [Aseprite ${{ steps.ver.outputs.version }}](https://github.com/aseprite/aseprite/releases/tag/${{ steps.ver.outputs.version }}).
 
-            > ⚠️ **Reminder:** Aseprite's source code is available under the EULA.
-            > You may build it yourself for personal use, but may not redistribute binaries.
+            > ⚠️ **Reminder:** Aseprite's source is available under a proprietary EULA.
+            > You may build it yourself for **personal use only** — redistribution of binaries is not permitted.
             > Please purchase a licence at https://www.aseprite.org/ to support the developers.
           files: artifacts/*.zip
           draft: false
