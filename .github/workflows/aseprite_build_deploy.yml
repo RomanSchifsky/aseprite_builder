@@ -53,8 +53,8 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Install Ninja
-        run: choco install ninja
+      - name: Verify Ninja
+        run: ninja --version
 
       - name: Get Skia from cache
         id: skia-cache
